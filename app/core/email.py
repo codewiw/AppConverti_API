@@ -12,7 +12,6 @@ def enviar_email_otp(email_destino: str, codigo_otp: str, nome_utilizador: str):
     message["From"] = sender_email
     message["To"] = email_destino
 
-    # Aqui já utilizamos o nome que o utilizador enviou no registo!
     html = f"""
     <html>
       <body style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
