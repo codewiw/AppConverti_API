@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.models.user import User
 from app.schemas.user import UserCreate, UserResponse
-from app.core.security import get_password_hash
+from app.schemas.token import Token, VerifyOTP
+from app.core.security import get_password_hash, verify_password, create_access_token
 from app.core.email import enviar_email_otp
 import random
 from datetime import datetime, timedelta, timezone
@@ -38,3 +40,46 @@ def register_user(user: UserCreate, background_tasks: BackgroundTasks, db: Sessi
     background_tasks.add_task(enviar_email_otp, novo_utilizador.email, codigo_otp, novo_utilizador.nome)
 
     return novo_utilizador
+
+@router.post("/verify")
+def verify_otp(data: VerifyOTP, db: Session = Depends(get_db)):
+    utilizador = db.query(User).filter(User.email == data.email).first()
+    
+    if not utilizador:
+        raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
+    
+    if utilizador.is_verified:
+        raise HTTPException(status_code=400, detail="Esta conta já está verificada.")
+        
+    if utilizador.otp_code != data.otp:
+        raise HTTPException(status_code=400, detail="Código inválido.")
+        
+    # Certifica-se de comparar tempos no mesmo fuso (UTC)
+    if utilizador.otp_expiry.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Este código já expirou. Peça um novo.")
+        
+    # Marca como verificado e limpa o OTP
+    utilizador.is_verified = True
+    utilizador.otp_code = None
+    utilizador.otp_expiry = None
+    db.commit()
+    
+    return {"message": "Conta ativada com sucesso!"}
+
+@router.post("/login", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    # O form_data.username guarda o e-mail no padrão OAuth2
+    utilizador = db.query(User).filter(User.email == form_data.username).first()
+    
+    # Valida e-mail e palavra-passe
+    if not utilizador or not verify_password(form_data.password, utilizador.hashed_password):
+        raise HTTPException(status_code=401, detail="E-mail ou palavra-passe incorretos.")
+        
+    # Impede login de quem não validou o e-mail
+    if not utilizador.is_verified:
+        raise HTTPException(status_code=403, detail="Verifique o seu e-mail antes de fazer login.")
+        
+    # Gera o Token embutindo o ID do utilizador
+    access_token = create_access_token(data={"sub": str(utilizador.id)})
+    
+    return {"access_token": access_token, "token_type": "bearer"}
