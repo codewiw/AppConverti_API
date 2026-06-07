@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from app.db.database import engine, Base
+from app.models import user
 
 # Ao iniciar, cria as tabelas automaticamente no Postgres caso não existam
 Base.metadata.create_all(bind=engine)
