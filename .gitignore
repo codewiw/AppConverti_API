@@ -156,7 +156,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -216,3 +215,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Banco de Dados Local (se usar SQLite para teste)
+*.sqlite3
+
+# Logs
+*.log
