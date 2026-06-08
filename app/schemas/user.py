@@ -17,3 +17,11 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class ForgotPassword(BaseModel):
+    email: EmailStr
+
+class ResetPassword(BaseModel):
+    email: EmailStr
+    otp: str
+    new_password: str
