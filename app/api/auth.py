@@ -7,13 +7,16 @@ from app.schemas.user import UserCreate, UserResponse, ForgotPassword, ResetPass
 from app.schemas.token import Token, VerifyOTP
 from app.core.security import get_password_hash, verify_password, create_access_token
 from app.core.email import enviar_email_otp, enviar_email_recuperacao
+from app.core.limiter import limiter
+from app.core.logger import logger
 import random
 from datetime import datetime, timedelta, timezone
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Autenticação"])
 
 @router.post("/register", response_model=UserResponse)
-def register_user(user: UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def register_user(request: Request, user: UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     # Verifica se o e-mail já existe
     utilizador_existente = db.query(User).filter(User.email == user.email).first()
     if utilizador_existente:
@@ -42,84 +45,103 @@ def register_user(user: UserCreate, background_tasks: BackgroundTasks, db: Sessi
     return novo_utilizador
 
 @router.post("/verify")
-def verify_otp(data: VerifyOTP, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def verify_otp(request: Request, data: VerifyOTP, db: Session = Depends(get_db)):
+    logger.info(f"Tentativa de verificação de OTP para: {data.email}")
+    
     utilizador = db.query(User).filter(User.email == data.email).first()
     
     if not utilizador:
+        logger.warning(f"Verificação falhou: Utilizador não encontrado ({data.email})")
         raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
     
     if utilizador.is_verified:
+        logger.warning(f"Verificação falhou: Conta já ativada ({data.email})")
         raise HTTPException(status_code=400, detail="Esta conta já está verificada.")
         
     if utilizador.otp_code != data.otp:
+        logger.warning(f"Verificação falhou: Código OTP inválido inserido ({data.email})")
         raise HTTPException(status_code=400, detail="Código inválido.")
         
-    # Certifica-se de comparar tempos no mesmo fuso (UTC)
     if utilizador.otp_expiry.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        logger.warning(f"Verificação falhou: Código OTP expirado ({data.email})")
         raise HTTPException(status_code=400, detail="Este código já expirou. Peça um novo.")
         
-    # Marca como verificado e limpa o OTP
+    # Sucesso
     utilizador.is_verified = True
     utilizador.otp_code = None
     utilizador.otp_expiry = None
     db.commit()
     
+    logger.success(f"Conta verificada com sucesso: {data.email}")
     return {"message": "Conta ativada com sucesso!"}
 
 @router.post("/login", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def login(request: Request,form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     # O form_data.username guarda o e-mail no padrão OAuth2
-    utilizador = db.query(User).filter(User.email == form_data.username).first()
+    logger.info(f"Tentativa de login para o usuário: {form_data.username}")
     
-    # Valida e-mail e palavra-passe
+    utilizador = db.query(User).filter(User.email == form_data.username).first()
     if not utilizador or not verify_password(form_data.password, utilizador.hashed_password):
+        logger.warning(f"Falha de login: Credenciais inválidas para {form_data.username}")
         raise HTTPException(status_code=401, detail="E-mail ou palavra-passe incorretos.")
         
-    # Impede login de quem não validou o e-mail
     if not utilizador.is_verified:
+        logger.warning(f"Falha de login: Conta não verificada para {form_data.username}")
         raise HTTPException(status_code=403, detail="Verifique o seu e-mail antes de fazer login.")
         
-    # Gera o Token embutindo o ID do utilizador
     access_token = create_access_token(data={"sub": str(utilizador.id)})
     
+    logger.success(f"Login efetuado com sucesso: {form_data.username}")
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.post("/forgot-password")
-def forgot_password(data: ForgotPassword, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+@limiter.limit("3/minute")
+def forgot_password(request: Request, data: ForgotPassword, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    logger.info(f"Pedido de recuperação de palavra-passe para: {data.email}")
+    
     usuario = db.query(User).filter(User.email == data.email).first()
     
-    # Por motivos de segurança devolvemos sempre sucesso, mesmo se o e-mail não existir
     if not usuario:
+        # Registamos o aviso nos logs, mas não avisamos o atacante na resposta da API
+        logger.info(f"Recuperação solicitada para e-mail inexistente: {data.email}")
         return {"message": "Se o e-mail estiver registado, receberá as instruções em breve."}
         
-    # Gera um novo código OTP e define a validade (10 minutos)
     codigo_otp = str(random.randint(100000, 999999))
     usuario.otp_code = codigo_otp
     usuario.otp_expiry = datetime.now(timezone.utc) + timedelta(minutes=10)
     db.commit()
     
-    # Dispara o e-mail de recuperação em background
     background_tasks.add_task(enviar_email_recuperacao, usuario.email, codigo_otp, usuario.nome)
     
+    logger.success(f"E-mail de recuperação gerado e colocado na fila para: {data.email}")
     return {"message": "Se o e-mail estiver registado, receberá as instruções em breve."}
 
 @router.post("/reset-password")
-def reset_password(data: ResetPassword, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def reset_password(request: Request, data: ResetPassword, db: Session = Depends(get_db)):
+    logger.info(f"Tentativa de redefinição de palavra-passe para: {data.email}")
+    
     usuario = db.query(User).filter(User.email == data.email).first()
     
     if not usuario:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+        logger.warning(f"Reset falhou: Utilizador não encontrado ({data.email})")
+        raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
         
     if usuario.otp_code != data.otp:
+        logger.warning(f"Reset falhou: Código OTP inválido ({data.email})")
         raise HTTPException(status_code=400, detail="Código inválido.")
         
     if usuario.otp_expiry.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        logger.warning(f"Reset falhou: Código OTP expirado ({data.email})")
         raise HTTPException(status_code=400, detail="Este código já expirou. Solicite um novo.")
         
-    # Criptografa a nova senha, limpa o OTP e salva.
+    # Sucesso
     usuario.hashed_password = get_password_hash(data.new_password)
     usuario.otp_code = None
     usuario.otp_expiry = None
     db.commit()
     
-    return {"message": "Senha alterada com sucesso! Já pode fazer login."}
+    logger.success(f"Palavra-passe redefinida com sucesso para: {data.email}")
+    return {"message": "Palavra-passe alterada com sucesso! Já pode fazer login."}
