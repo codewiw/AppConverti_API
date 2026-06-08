@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from app.db.database import engine, Base
-from app.models import user
-from app.api import auth
+from app.models import user, favorite
+from app.api import auth, favorites
 
 Base.metadata.create_all(bind=engine)
 
