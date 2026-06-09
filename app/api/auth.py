@@ -1,32 +1,42 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
-from fastapi.security import OAuth2PasswordRequestForm
+import random
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, status
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlalchemy.orm import Session
+from jose import JWTError, jwt
+
 from app.db.database import get_db
 from app.models.user import User
 from app.schemas.user import UserCreate, UserResponse, ForgotPassword, ResetPassword
 from app.schemas.token import Token, VerifyOTP
-from app.core.security import get_password_hash, verify_password, create_access_token
+
+# Importação correta puxando as variáveis do seu arquivo de segurança
+from app.core.security import (
+    get_password_hash, 
+    verify_password, 
+    create_access_token, 
+    SECRET_KEY, 
+    ALGORITHM
+)
 from app.core.email import enviar_email_otp, enviar_email_recuperacao
 from app.core.limiter import limiter
 from app.core.logger import logger
-import random
-from datetime import datetime, timedelta, timezone
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Autenticação"])
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+
 
 @router.post("/register", response_model=UserResponse)
 @limiter.limit("5/minute")
 def register_user(request: Request, user: UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    # Verifica se o e-mail já existe
     utilizador_existente = db.query(User).filter(User.email == user.email).first()
     if utilizador_existente:
         raise HTTPException(status_code=400, detail="Este e-mail já está registado.")
 
-    # Gera o código de 6 dígitos e o tempo limite
     codigo_otp = str(random.randint(100000, 999999))
     expira_em = datetime.now(timezone.utc) + timedelta(minutes=10)
 
-    # Cria o utilizador com a palavra-passe encriptada
     novo_utilizador = User(
         nome=user.nome,
         email=user.email,
@@ -39,10 +49,10 @@ def register_user(request: Request, user: UserCreate, background_tasks: Backgrou
     db.commit()
     db.refresh(novo_utilizador)
 
-    # Envia o e-mail em segundo plano para não bloquear a resposta do servidor
     background_tasks.add_task(enviar_email_otp, novo_utilizador.email, codigo_otp, novo_utilizador.nome)
 
     return novo_utilizador
+
 
 @router.post("/verify")
 @limiter.limit("5/minute")
@@ -67,7 +77,6 @@ def verify_otp(request: Request, data: VerifyOTP, db: Session = Depends(get_db))
         logger.warning(f"Verificação falhou: Código OTP expirado ({data.email})")
         raise HTTPException(status_code=400, detail="Este código já expirou. Peça um novo.")
         
-    # Sucesso
     utilizador.is_verified = True
     utilizador.otp_code = None
     utilizador.otp_expiry = None
@@ -76,10 +85,10 @@ def verify_otp(request: Request, data: VerifyOTP, db: Session = Depends(get_db))
     logger.success(f"Conta verificada com sucesso: {data.email}")
     return {"message": "Conta ativada com sucesso!"}
 
+
 @router.post("/login", response_model=Token)
 @limiter.limit("5/minute")
-def login(request: Request,form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    # O form_data.username guarda o e-mail no padrão OAuth2
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     logger.info(f"Tentativa de login para o usuário: {form_data.username}")
     
     utilizador = db.query(User).filter(User.email == form_data.username).first()
@@ -96,6 +105,7 @@ def login(request: Request,form_data: OAuth2PasswordRequestForm = Depends(), db:
     logger.success(f"Login efetuado com sucesso: {form_data.username}")
     return {"access_token": access_token, "token_type": "bearer"}
 
+
 @router.post("/forgot-password")
 @limiter.limit("3/minute")
 def forgot_password(request: Request, data: ForgotPassword, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -104,7 +114,6 @@ def forgot_password(request: Request, data: ForgotPassword, background_tasks: Ba
     usuario = db.query(User).filter(User.email == data.email).first()
     
     if not usuario:
-        # Registamos o aviso nos logs, mas não avisamos o atacante na resposta da API
         logger.info(f"Recuperação solicitada para e-mail inexistente: {data.email}")
         return {"message": "Se o e-mail estiver registado, receberá as instruções em breve."}
         
@@ -117,6 +126,7 @@ def forgot_password(request: Request, data: ForgotPassword, background_tasks: Ba
     
     logger.success(f"E-mail de recuperação gerado e colocado na fila para: {data.email}")
     return {"message": "Se o e-mail estiver registado, receberá as instruções em breve."}
+
 
 @router.post("/reset-password")
 @limiter.limit("5/minute")
@@ -137,7 +147,6 @@ def reset_password(request: Request, data: ResetPassword, db: Session = Depends(
         logger.warning(f"Reset falhou: Código OTP expirado ({data.email})")
         raise HTTPException(status_code=400, detail="Este código já expirou. Solicite um novo.")
         
-    # Sucesso
     usuario.hashed_password = get_password_hash(data.new_password)
     usuario.otp_code = None
     usuario.otp_expiry = None
@@ -145,3 +154,33 @@ def reset_password(request: Request, data: ResetPassword, db: Session = Depends(
     
     logger.success(f"Palavra-passe redefinida com sucesso para: {data.email}")
     return {"message": "Palavra-passe alterada com sucesso! Já pode fazer login."}
+
+
+@router.get("/me")
+@limiter.limit("10/minute")
+def get_user_profile(request: Request, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Não foi possível validar as credenciais",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        # Usa o SECRET_KEY e ALGORITHM importados do app.core.security
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    utilizador = db.query(User).filter(User.id == user_id).first()
+    
+    if not utilizador:
+        raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
+        
+    return {
+        "nome": utilizador.nome,
+        "email": utilizador.email
+    }
